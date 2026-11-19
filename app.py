@@ -119,13 +119,13 @@ def api_summary():
     cur.execute("SELECT COUNT(*) FROM products WHERE in_stock = 1 AND is_real_deal = 1")
     real_deals = cur.fetchone()[0] or 0
 
-    cur.execute("SELECT COALESCE(MAX(discount_pct), 0), MAX(updated_at) FROM products WHERE in_stock = 1")
+    cur.execute("SELECT COALESCE(MAX(CAST(discount_pct AS REAL)), 0), MAX(updated_at) FROM products WHERE in_stock = 1")
     row = cur.fetchone()
     max_disc = round(row[0] or 0, 1)
     last_updated = row[1]
 
     cur.execute("""
-        SELECT category, COUNT(*) as cnt, COALESCE(MAX(discount_pct), 0) as max_disc
+        SELECT category, COUNT(*) as cnt, COALESCE(MAX(CAST(discount_pct AS REAL)), 0) as max_disc
         FROM products
         WHERE in_stock = 1 AND category IS NOT NULL AND category != ''
         GROUP BY category
@@ -174,17 +174,17 @@ def api_products(
     if real_only == 1:
         where.append("is_real_deal = 1")
     if min_discount > 0:
-        where.append("discount_pct >= ?")
+        where.append("CAST(discount_pct AS REAL) >= ?")
         params.append(min_discount)
 
     where_sql = " AND ".join(where)
 
     order_map = {
-        "recent": "last_price_change_at DESC, updated_at DESC",
-        "discount": "discount_pct DESC, current_price ASC",
-        "price_asc": "current_price ASC",
-        "price_desc": "current_price DESC",
-        "real": "is_real_deal DESC, discount_pct DESC",
+        "recent": "CAST(last_price_change_at AS REAL) DESC, CAST(updated_at AS REAL) DESC, sku ASC",
+        "discount": "CAST(discount_pct AS REAL) DESC, CAST(current_price AS REAL) ASC, sku ASC",
+        "price_asc": "CAST(current_price AS REAL) ASC, sku ASC",
+        "price_desc": "CAST(current_price AS REAL) DESC, sku ASC",
+        "real": "CAST(is_real_deal AS REAL) DESC, CAST(discount_pct AS REAL) DESC, sku ASC",
     }
     order_sql = order_map.get(sort, order_map["recent"])
 
@@ -208,6 +208,12 @@ def api_products(
     items = []
     for r in cur.fetchall():
         d = dict(r)
+        d["current_price"] = float(d["current_price"] or 0)
+        d["old_price"] = float(d["old_price"]) if d["old_price"] is not None else None
+        d["discount_pct"] = float(d["discount_pct"] or 0)
+        d["lowest_price"] = float(d["lowest_price"] or d["current_price"])
+        d["highest_price"] = float(d["highest_price"] or d["current_price"])
+        d["avg_price"] = float(d["avg_price"] or d["current_price"])
         d["affiliate_url"] = apply_affiliate(d["product_url"])
         d["updated_ago"] = format_time_ago(d["last_price_change_at"] or d["updated_at"])
         d["is_lowest_now"] = 1 if d["current_price"] <= d["lowest_price"] else 0
@@ -239,7 +245,7 @@ def api_history(sku: str):
     )
     hist = [
         {
-            "price": r["price"],
+            "price": float(r["price"] or 0),
             "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["recorded_at"])),
         }
         for r in cur.fetchall()
@@ -313,7 +319,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             --text-secondary: #94A3B8;
             --text-muted: #64748B;
             --shadow-card: 0 12px 30px rgba(0, 0, 0, 0.35);
-            --header-bg: rgba(11, 13, 18, 0.88);
+            --header-bg: #11151F;
         }}
 
         html[data-theme="light"] {{
@@ -328,7 +334,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             --text-secondary: #475569;
             --text-muted: #64748B;
             --shadow-card: 0 10px 26px rgba(15, 23, 42, 0.07);
-            --header-bg: rgba(255, 255, 255, 0.92);
+            --header-bg: #FFFFFF;
         }}
 
         * {{
@@ -359,13 +365,11 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             padding: 0 20px;
         }}
 
-        /* ===== Top Navbar ===== */
+        /* ===== Top Navbar (Non-sticky) ===== */
         .navbar {{
-            position: sticky;
-            top: 0;
-            z-index: 100;
+            position: relative;
+            z-index: 50;
             background: var(--header-bg);
-            backdrop-filter: blur(14px);
             border-bottom: 1px solid var(--border-color);
         }}
 
@@ -373,8 +377,8 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             display: flex;
             align-items: center;
             justify-content: space-between;
-            gap: 16px;
-            min-height: 74px;
+            gap: 14px;
+            min-height: 68px;
             flex-wrap: wrap;
             padding: 10px 0;
         }}
@@ -382,14 +386,14 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         .brand-link {{
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 10px;
             flex-shrink: 0;
         }}
 
         .brand-logo-img {{
-            height: 44px;
+            height: 40px;
             width: auto;
-            border-radius: 12px;
+            border-radius: 10px;
             object-fit: contain;
         }}
 
@@ -398,7 +402,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             align-items: center;
             justify-content: center;
             box-shadow: 0 6px 18px rgba(206, 17, 38, 0.35);
-            border-radius: 16px;
+            border-radius: 14px;
         }}
 
         .brand-text {{
@@ -408,7 +412,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         }}
 
         .brand-title {{
-            font-size: 1.2rem;
+            font-size: 1.15rem;
             font-weight: 900;
             letter-spacing: -0.3px;
             display: flex;
@@ -421,7 +425,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         }}
 
         .brand-sub {{
-            font-size: 0.74rem;
+            font-size: 0.72rem;
             color: var(--text-secondary);
             font-weight: 600;
         }}
@@ -438,9 +442,9 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             background: var(--bg-input);
             border: 1px solid var(--border-color);
             color: var(--text-primary);
-            padding: 10px 42px 10px 14px;
+            padding: 9px 40px 9px 14px;
             border-radius: 999px;
-            font-size: 0.9rem;
+            font-size: 0.88rem;
             outline: none;
             transition: var(--transition);
         }}
@@ -470,15 +474,16 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         }}
 
         .nav-link {{
-            padding: 8px 13px;
-            border-radius: 11px;
-            font-size: 0.9rem;
+            padding: 7px 12px;
+            border-radius: 10px;
+            font-size: 0.88rem;
             font-weight: 700;
             color: var(--text-secondary);
             transition: var(--transition);
             display: inline-flex;
             align-items: center;
             gap: 6px;
+            flex-shrink: 0;
         }}
 
         .nav-link:hover {{
@@ -505,17 +510,18 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             display: flex;
             align-items: center;
             gap: 8px;
+            flex-shrink: 0;
         }}
 
         .theme-btn {{
-            width: 40px;
-            height: 40px;
-            border-radius: 12px;
+            width: 36px;
+            height: 36px;
+            border-radius: 10px;
             border: 1px solid var(--border-color);
             background: var(--bg-card);
             color: var(--text-primary);
             cursor: pointer;
-            font-size: 1.05rem;
+            font-size: 1rem;
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -524,18 +530,18 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
 
         .theme-btn:hover {{
             border-color: var(--bh-red-bright);
-            transform: translateY(-1px);
         }}
 
         .btn-outline {{
-            padding: 8px 14px;
-            border-radius: 11px;
+            padding: 7px 12px;
+            border-radius: 10px;
             border: 1px solid var(--border-color);
             background: var(--bg-card);
             color: var(--text-primary);
             font-weight: 700;
-            font-size: 0.86rem;
+            font-size: 0.84rem;
             transition: var(--transition);
+            white-space: nowrap;
         }}
 
         .btn-outline:hover {{
@@ -543,19 +549,20 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         }}
 
         .btn-primary {{
-            padding: 8px 16px;
-            border-radius: 11px;
+            padding: 7px 14px;
+            border-radius: 10px;
             border: none;
             background: linear-gradient(135deg, #CE1126, #EF233C);
             color: #FFFFFF;
             font-weight: 800;
-            font-size: 0.86rem;
+            font-size: 0.84rem;
             cursor: pointer;
             box-shadow: 0 6px 18px rgba(206, 17, 38, 0.32);
             transition: var(--transition);
             display: inline-flex;
             align-items: center;
             gap: 6px;
+            white-space: nowrap;
         }}
 
         .btn-primary:hover {{
@@ -566,7 +573,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         /* ===== Main Content ===== */
         main {{
             flex: 1;
-            padding: 26px 0 60px;
+            padding: 22px 0 60px;
         }}
 
         /* ===== Hero Section ===== */
@@ -1089,15 +1096,15 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         /* ===== Floating Telegram Button ===== */
         .float-tg {{
             position: fixed;
-            bottom: 22px;
-            left: 22px;
+            bottom: 20px;
+            left: 20px;
             z-index: 90;
             background: linear-gradient(135deg, #0088cc, #229ED9);
             color: #FFFFFF;
-            padding: 12px 18px;
+            padding: 11px 16px;
             border-radius: 999px;
             font-weight: 800;
-            font-size: 0.88rem;
+            font-size: 0.85rem;
             box-shadow: 0 10px 25px rgba(0, 136, 204, 0.38);
             display: inline-flex;
             align-items: center;
@@ -1161,7 +1168,67 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             }}
         }}
 
+        /* Slim, non-sticky mobile navbar with horizontal scrollable nav tabs */
         @media (max-width: 600px) {{
+            .container {{
+                padding: 0 12px;
+            }}
+            .navbar-inner {{
+                min-height: auto;
+                gap: 8px;
+                padding: 8px 0;
+            }}
+            .brand-logo-img {{
+                height: 30px;
+            }}
+            .brand-title {{
+                font-size: 0.95rem;
+            }}
+            .brand-sub {{
+                display: none;
+            }}
+            .nav-actions {{
+                gap: 5px;
+            }}
+            .theme-btn {{
+                width: 30px;
+                height: 30px;
+                font-size: 0.85rem;
+                border-radius: 8px;
+            }}
+            .btn-outline, .btn-primary {{
+                padding: 5px 9px;
+                font-size: 0.75rem;
+                border-radius: 8px;
+            }}
+            .nav-search {{
+                order: 3;
+                flex: 0 0 100%;
+                max-width: 100%;
+                min-width: 0;
+            }}
+            .nav-search input {{
+                padding: 7px 34px 7px 12px;
+                font-size: 0.82rem;
+            }}
+            .nav-links {{
+                order: 4;
+                flex: 0 0 100%;
+                flex-wrap: nowrap;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: none;
+                gap: 6px;
+                padding-bottom: 2px;
+            }}
+            .nav-links::-webkit-scrollbar {{
+                display: none;
+            }}
+            .nav-link {{
+                padding: 5px 10px;
+                font-size: 0.8rem;
+                white-space: nowrap;
+            }}
             .footer-grid {{
                 grid-template-columns: 1fr;
             }}
@@ -1182,24 +1249,24 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
                 </div>
             </a>
 
+            <div class="nav-actions">
+                <button type="button" class="theme-btn" id="themeToggleBtn" title="تبديل الوضع الليلي / النهاري">☀️</button>
+                <a href="/login" class="btn-outline">دخول</a>
+                <a href="/register" class="btn-primary">حساب جديد</a>
+            </div>
+
             <form class="nav-search" action="/deals" method="get">
                 <input type="text" name="q" id="globalSearchInput" placeholder="ابحث عن منتج في البحرين (آيفون، لابتوب، عطور...)" />
                 <button type="submit" aria-label="بحث">🔍</button>
             </form>
 
-            <nav class="nav-links">
+            <nav class="nav-links" aria-label="التنقل الرئيسي">
                 <a href="/" class="{nav_cls('home')}">الرئيسية</a>
                 <a href="/deals" class="{nav_cls('deals')}"><span class="live-dot"></span> دلوقتي</a>
                 <a href="/categories" class="{nav_cls('categories')}">الأقسام</a>
                 <a href="/coupons" class="{nav_cls('coupons')}">🎟️ كوبونات</a>
                 <a href="/stores" class="{nav_cls('stores')}">المتاجر</a>
             </nav>
-
-            <div class="nav-actions">
-                <button type="button" class="theme-btn" id="themeToggleBtn" title="تبديل الوضع الليلي / النهاري">☀️</button>
-                <a href="/login" class="btn-outline">دخول</a>
-                <a href="/register" class="btn-primary">حساب جديد</a>
-            </div>
         </div>
     </header>
 
@@ -1281,7 +1348,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
     </footer>
 
     <script>
-        // Theme Switcher
         (function() {{
             const saved = localStorage.getItem('mshatshata_theme') || 'dark';
             document.documentElement.setAttribute('data-theme', saved);
@@ -1308,7 +1374,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
 
         function renderProductCard(p) {{
             const img = p.image_url || 'https://via.placeholder.com/300x300?text=No+Image';
-            const oldHtml = p.old_price ? `<span class="price-old">${{p.old_price.toFixed(2)}} د.ب</span>` : '';
+            const oldHtml = p.old_price ? `<span class="price-old">${{Number(p.old_price).toFixed(2)}} د.ب</span>` : '';
             const discHtml = p.discount_pct > 0 ? `<span class="badge-disc">-${{Math.round(p.discount_pct)}}%</span>` : '';
             const realHtml = p.is_real_deal ? `<span class="badge-real">🔥 لقطة حقيقية</span>` : (p.is_lowest_now ? `<span class="badge-real">📉 أقل سعر</span>` : '');
             return `
@@ -1583,7 +1649,7 @@ def page_deals():
             <option value="price_desc">السعر: من الأعلى للأقل</option>
         </select>
         <button type="button" id="toggleRealBtn" class="chip-toggle">🔥 لقطات حقيقية فقط</button>
-        <button type="button" onclick="applyFilters(1)" class="btn-primary">تطبيق</button>
+        <button type="button" id="applyBtn" class="btn-primary">تطبيق</button>
     </div>
 
     <div class="products-grid" id="dealsGrid"></div>
@@ -1594,6 +1660,7 @@ def page_deals():
     <script>
         const urlParams = new URLSearchParams(window.location.search);
         let realOnly = urlParams.get('real_only') === '1' ? 1 : 0;
+        const activeStore = urlParams.get('store') || '';
         let currentPage = 1;
 
         document.getElementById('filterQ').value = urlParams.get('q') || '';
@@ -1604,6 +1671,25 @@ def page_deals():
             realOnly = realOnly ? 0 : 1;
             this.classList.toggle('active', realOnly === 1);
             applyFilters(1);
+        });
+
+        document.getElementById('filterSort').addEventListener('change', function() {
+            applyFilters(1);
+        });
+
+        document.getElementById('filterCat').addEventListener('change', function() {
+            applyFilters(1);
+        });
+
+        document.getElementById('applyBtn').addEventListener('click', function() {
+            applyFilters(1);
+        });
+
+        document.getElementById('filterQ').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                applyFilters(1);
+            }
         });
 
         async function initCategoriesFilter() {
@@ -1627,7 +1713,7 @@ def page_deals():
             const sort = document.getElementById('filterSort').value;
 
             const qs = new URLSearchParams({
-                q, category: cat, sort, real_only: realOnly, page, limit: 24
+                q, category: cat, store: activeStore, sort, real_only: realOnly, page, limit: 24
             });
             const res = await fetch('/api/products?' + qs.toString());
             const data = await res.json();
