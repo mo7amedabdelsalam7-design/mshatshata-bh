@@ -1,61 +1,89 @@
+import html
 import os
-import sqlite3
 import time
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 import uvicorn
 
-DB_FILE = "bahrain_deals.db"
+from google_auth import get_current_user, get_db, is_pg, setup_google_auth
+
 AFFILIATE_PARAM = "utm_source"
 AFFILIATE_CODE = ""
 TELEGRAM_CHANNEL_URL = "https://t.me/+FN5Lg1E3z0MyYWY0"
 
 app = FastAPI(title="تخفيضات مشطشطة — عروض البحرين")
-
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+setup_google_auth(app)
 
 
 def ensure_db_ready():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db()
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            sku TEXT PRIMARY KEY,
-            store TEXT DEFAULT 'noon_bh',
-            name TEXT NOT NULL,
-            category TEXT,
-            image_url TEXT,
-            product_url TEXT NOT NULL,
-            current_price REAL NOT NULL,
-            old_price REAL,
-            discount_pct REAL DEFAULT 0,
-            lowest_price REAL NOT NULL,
-            highest_price REAL NOT NULL,
-            avg_price REAL NOT NULL,
-            is_real_deal INTEGER DEFAULT 0,
-            in_stock INTEGER DEFAULT 1,
-            last_alert_at REAL DEFAULT 0,
-            last_alert_price REAL,
-            last_price_change_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS price_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku TEXT NOT NULL,
-            price REAL NOT NULL,
-            recorded_at REAL NOT NULL,
-            FOREIGN KEY (sku) REFERENCES products(sku)
-        )
-    """)
+    if conn.kind == "pg":
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                sku TEXT PRIMARY KEY,
+                store TEXT DEFAULT 'noon_bh',
+                name TEXT NOT NULL,
+                category TEXT,
+                image_url TEXT,
+                product_url TEXT NOT NULL,
+                current_price DOUBLE PRECISION NOT NULL,
+                old_price DOUBLE PRECISION,
+                discount_pct DOUBLE PRECISION DEFAULT 0,
+                lowest_price DOUBLE PRECISION NOT NULL,
+                highest_price DOUBLE PRECISION NOT NULL,
+                avg_price DOUBLE PRECISION NOT NULL,
+                is_real_deal INTEGER DEFAULT 0,
+                in_stock INTEGER DEFAULT 1,
+                last_alert_at DOUBLE PRECISION DEFAULT 0,
+                last_alert_price DOUBLE PRECISION,
+                last_price_change_at DOUBLE PRECISION NOT NULL,
+                updated_at DOUBLE PRECISION NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id SERIAL PRIMARY KEY,
+                sku TEXT NOT NULL REFERENCES products(sku),
+                price DOUBLE PRECISION NOT NULL,
+                recorded_at DOUBLE PRECISION NOT NULL
+            )
+        """)
+    else:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                sku TEXT PRIMARY KEY,
+                store TEXT DEFAULT 'noon_bh',
+                name TEXT NOT NULL,
+                category TEXT,
+                image_url TEXT,
+                product_url TEXT NOT NULL,
+                current_price REAL NOT NULL,
+                old_price REAL,
+                discount_pct REAL DEFAULT 0,
+                lowest_price REAL NOT NULL,
+                highest_price REAL NOT NULL,
+                avg_price REAL NOT NULL,
+                is_real_deal INTEGER DEFAULT 0,
+                in_stock INTEGER DEFAULT 1,
+                last_alert_at REAL DEFAULT 0,
+                last_alert_price REAL,
+                last_price_change_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku TEXT NOT NULL,
+                price REAL NOT NULL,
+                recorded_at REAL NOT NULL,
+                FOREIGN KEY (sku) REFERENCES products(sku)
+            )
+        """)
     conn.commit()
     conn.close()
 
@@ -72,7 +100,7 @@ def apply_affiliate(raw_url: str) -> str:
 def format_time_ago(ts: Optional[float]) -> str:
     if not ts:
         return "الآن"
-    diff = max(0, int(time.time() - ts))
+    diff = max(0, int(time.time() - float(ts)))
     if diff < 60:
         return "منذ لحظات"
     if diff < 3600:
@@ -80,6 +108,31 @@ def format_time_ago(ts: Optional[float]) -> str:
     if diff < 86400:
         return f"منذ {diff // 3600} ساعة"
     return f"منذ {diff // 86400} يوم"
+
+
+def get_user_saved_keys(user_id: Optional[int]) -> list[str]:
+    if not user_id:
+        return []
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT deal_key FROM saved_deals WHERE user_id = ?", (user_id,))
+    keys = [r["deal_key"] for r in cur.fetchall()]
+    conn.close()
+    return keys
+
+
+def build_header_auth_html(user: Optional[dict]) -> str:
+    if not user:
+        return """
+        <a href="/login/google" class="btn-primary">دخول بجوجل</a>
+        <a href="/login" class="btn-outline">دخول</a>
+        """
+    safe_name = html.escape(user.get("name") or "مستخدم")
+    return f"""
+        <a href="/wishlist" class="btn-primary">⭐ المفضلة</a>
+        <span style="font-size:0.82rem; font-weight:800; color:var(--text-secondary); white-space:nowrap;">{safe_name}</span>
+        <a href="/logout" class="btn-outline">خروج</a>
+    """
 
 
 @app.on_event("startup")
@@ -113,26 +166,31 @@ def serve_logo():
 def api_summary():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM products WHERE in_stock = 1")
-    total_active = cur.fetchone()[0] or 0
 
-    cur.execute("SELECT COUNT(*) FROM products WHERE in_stock = 1 AND is_real_deal = 1")
-    real_deals = cur.fetchone()[0] or 0
+    cur.execute("SELECT COUNT(*) AS cnt FROM products WHERE in_stock = 1")
+    total_active = (cur.fetchone() or {}).get("cnt", 0) or 0
 
-    cur.execute("SELECT COALESCE(MAX(CAST(discount_pct AS REAL)), 0), MAX(updated_at) FROM products WHERE in_stock = 1")
-    row = cur.fetchone()
-    max_disc = round(row[0] or 0, 1)
-    last_updated = row[1]
+    cur.execute("SELECT COUNT(*) AS cnt FROM products WHERE in_stock = 1 AND is_real_deal = 1")
+    real_deals = (cur.fetchone() or {}).get("cnt", 0) or 0
+
+    cur.execute("SELECT COALESCE(MAX(discount_pct), 0) AS max_d, MAX(updated_at) AS last_u FROM products WHERE in_stock = 1")
+    row = cur.fetchone() or {}
+    max_disc = round(float(row.get("max_d") or 0), 1)
+    last_updated = row.get("last_u")
 
     cur.execute("""
-        SELECT category, COUNT(*) as cnt, COALESCE(MAX(CAST(discount_pct AS REAL)), 0) as max_disc
+        SELECT category, COUNT(*) AS cnt, COALESCE(MAX(discount_pct), 0) AS max_disc
         FROM products
         WHERE in_stock = 1 AND category IS NOT NULL AND category != ''
         GROUP BY category
         ORDER BY cnt DESC
     """)
     categories = [
-        {"name": r["category"], "count": r["cnt"], "max_discount": round(r["max_disc"], 0)}
+        {
+            "name": r["category"],
+            "count": int(r["cnt"] or 0),
+            "max_discount": round(float(r["max_disc"] or 0), 0),
+        }
         for r in cur.fetchall()
     ]
     conn.close()
@@ -147,6 +205,7 @@ def api_summary():
 
 @app.get("/api/products")
 def api_products(
+    request: Request,
     q: str = "",
     category: str = "",
     store: str = "",
@@ -156,14 +215,18 @@ def api_products(
     page: int = Query(1, ge=1),
     limit: int = Query(24, ge=1, le=100),
 ):
+    user = get_current_user(request)
+    saved_keys = set(get_user_saved_keys(user["id"] if user else None))
+
     conn = get_db()
     cur = conn.cursor()
 
+    like_op = "ILIKE" if is_pg() else "LIKE"
     where = ["in_stock = 1"]
     params = []
 
     if q.strip():
-        where.append("name LIKE ?")
+        where.append(f"name {like_op} ?")
         params.append(f"%{q.strip()}%")
     if category.strip():
         where.append("category = ?")
@@ -174,22 +237,22 @@ def api_products(
     if real_only == 1:
         where.append("is_real_deal = 1")
     if min_discount > 0:
-        where.append("CAST(discount_pct AS REAL) >= ?")
+        where.append("discount_pct >= ?")
         params.append(min_discount)
 
     where_sql = " AND ".join(where)
 
     order_map = {
-        "recent": "CAST(last_price_change_at AS REAL) DESC, CAST(updated_at AS REAL) DESC, sku ASC",
-        "discount": "CAST(discount_pct AS REAL) DESC, CAST(current_price AS REAL) ASC, sku ASC",
-        "price_asc": "CAST(current_price AS REAL) ASC, sku ASC",
-        "price_desc": "CAST(current_price AS REAL) DESC, sku ASC",
-        "real": "CAST(is_real_deal AS REAL) DESC, CAST(discount_pct AS REAL) DESC, sku ASC",
+        "recent": "last_price_change_at DESC, updated_at DESC, sku ASC",
+        "discount": "discount_pct DESC, current_price ASC, sku ASC",
+        "price_asc": "current_price ASC, sku ASC",
+        "price_desc": "current_price DESC, sku ASC",
+        "real": "is_real_deal DESC, discount_pct DESC, sku ASC",
     }
     order_sql = order_map.get(sort, order_map["recent"])
 
-    cur.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params)
-    total = cur.fetchone()[0] or 0
+    cur.execute(f"SELECT COUNT(*) AS cnt FROM products WHERE {where_sql}", params)
+    total = int((cur.fetchone() or {}).get("cnt", 0) or 0)
 
     offset = (page - 1) * limit
     cur.execute(
@@ -217,6 +280,7 @@ def api_products(
         d["affiliate_url"] = apply_affiliate(d["product_url"])
         d["updated_ago"] = format_time_ago(d["last_price_change_at"] or d["updated_at"])
         d["is_lowest_now"] = 1 if d["current_price"] <= d["lowest_price"] else 0
+        d["is_saved"] = 1 if str(d["sku"]) in saved_keys else 0
         items.append(d)
 
     conn.close()
@@ -246,7 +310,7 @@ def api_history(sku: str):
     hist = [
         {
             "price": float(r["price"] or 0),
-            "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(r["recorded_at"])),
+            "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(float(r["recorded_at"]))),
         }
         for r in cur.fetchall()
     ]
@@ -256,8 +320,13 @@ def api_history(sku: str):
     return {"product": prod_dict, "history": hist}
 
 
-# ===== Shared Layout & Pages =====
-def render_layout(page_title: str, active_nav: str, body_html: str, extra_script: str = "") -> str:
+def render_layout(
+    page_title: str,
+    active_nav: str,
+    body_html: str,
+    extra_script: str = "",
+    user: Optional[dict] = None,
+) -> str:
     has_custom_logo = os.path.exists("logo.png")
     logo_visual = (
         '<img src="/logo.png" alt="تخفيضات مشطشطة" class="brand-logo-img" />'
@@ -282,6 +351,8 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
 
     def nav_cls(key: str) -> str:
         return "nav-link active" if active_nav == key else "nav-link"
+
+    auth_buttons_html = build_header_auth_html(user)
 
     return f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl" data-theme="dark">
@@ -365,7 +436,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             padding: 0 20px;
         }}
 
-        /* ===== Top Navbar (Non-sticky) ===== */
         .navbar {{
             position: relative;
             z-index: 50;
@@ -570,13 +640,11 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             filter: brightness(1.06);
         }}
 
-        /* ===== Main Content ===== */
         main {{
             flex: 1;
             padding: 22px 0 60px;
         }}
 
-        /* ===== Hero Section ===== */
         .hero-box {{
             position: relative;
             overflow: hidden;
@@ -687,7 +755,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             border: 1px solid var(--border-color);
         }}
 
-        /* ===== Section Header ===== */
         .sec-head {{
             display: flex;
             align-items: center;
@@ -710,7 +777,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             color: var(--text-secondary);
         }}
 
-        /* ===== Stores & Categories Grid ===== */
         .stores-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(195px, 1fr));
@@ -799,7 +865,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             flex-shrink: 0;
         }}
 
-        /* ===== Products Grid ===== */
         .products-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
@@ -933,18 +998,18 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
 
         .card-actions {{
             display: grid;
-            grid-template-columns: 1fr auto;
-            gap: 8px;
+            grid-template-columns: 1fr auto auto;
+            gap: 6px;
         }}
 
         .btn-buy {{
             background: var(--bh-red);
             color: #FFFFFF;
             text-align: center;
-            padding: 9px 12px;
+            padding: 9px 10px;
             border-radius: 10px;
             font-weight: 800;
-            font-size: 0.84rem;
+            font-size: 0.82rem;
             transition: var(--transition);
         }}
 
@@ -956,10 +1021,10 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             background: var(--bg-input);
             border: 1px solid var(--border-color);
             color: var(--text-primary);
-            padding: 9px 12px;
+            padding: 9px 10px;
             border-radius: 10px;
             font-weight: 700;
-            font-size: 0.82rem;
+            font-size: 0.8rem;
             cursor: pointer;
             transition: var(--transition);
         }}
@@ -968,7 +1033,12 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             border-color: var(--bh-red-bright);
         }}
 
-        /* ===== Filter Bar ===== */
+        .btn-save.saved {{
+            background: rgba(16, 185, 129, 0.18);
+            border-color: #10B981;
+            color: #10B981;
+        }}
+
         .filter-bar {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -1008,7 +1078,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             color: #10B981;
         }}
 
-        /* ===== Coupons ===== */
         .coupon-card {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -1034,7 +1103,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             color: var(--bh-red-bright);
         }}
 
-        /* ===== Auth Card ===== */
         .auth-wrap {{
             max-width: 440px;
             margin: 24px auto;
@@ -1067,7 +1135,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             font-size: 0.92rem;
         }}
 
-        /* ===== Modal ===== */
         .modal-backdrop {{
             position: fixed;
             inset: 0;
@@ -1093,7 +1160,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
         }}
 
-        /* ===== Floating Telegram Button ===== */
         .float-tg {{
             position: fixed;
             bottom: 20px;
@@ -1116,7 +1182,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             transform: translateY(-2px);
         }}
 
-        /* ===== Footer ===== */
         footer {{
             background: var(--bg-surface);
             border-top: 1px solid var(--border-color);
@@ -1168,7 +1233,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
             }}
         }}
 
-        /* Slim, non-sticky mobile navbar with horizontal scrollable nav tabs */
         @media (max-width: 600px) {{
             .container {{
                 padding: 0 12px;
@@ -1251,8 +1315,7 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
 
             <div class="nav-actions">
                 <button type="button" class="theme-btn" id="themeToggleBtn" title="تبديل الوضع الليلي / النهاري">☀️</button>
-                <a href="/login" class="btn-outline">دخول</a>
-                <a href="/register" class="btn-primary">حساب جديد</a>
+                {auth_buttons_html}
             </div>
 
             <form class="nav-search" action="/deals" method="get">
@@ -1278,7 +1341,6 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
         ✈️ قناة اللقطات على تيليجرام
     </a>
 
-    <!-- Price History Modal -->
     <div class="modal-backdrop" id="historyModal" onclick="if(event.target===this) closeHistoryModal()">
         <div class="modal-card">
             <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
@@ -1372,11 +1434,40 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
                 .replace(/"/g, '&quot;');
         }}
 
+        async function toggleSaveDeal(btn, payload) {{
+            try {{
+                const res = await fetch('/api/wishlist/toggle', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify(payload)
+                }});
+                if (res.status === 401) {{
+                    const nextUrl = encodeURIComponent(window.location.pathname + window.location.search);
+                    window.location.href = '/login/google?next=' + nextUrl;
+                    return;
+                }}
+                const data = await res.json();
+                if (data.ok) {{
+                    btn.classList.toggle('saved', !!data.saved);
+                    btn.textContent = data.saved ? '⭐ محفوظ' : '☆ حفظ';
+                }}
+            }} catch (e) {{
+                console.error(e);
+            }}
+        }}
+
         function renderProductCard(p) {{
             const img = p.image_url || 'https://via.placeholder.com/300x300?text=No+Image';
             const oldHtml = p.old_price ? `<span class="price-old">${{Number(p.old_price).toFixed(2)}} د.ب</span>` : '';
             const discHtml = p.discount_pct > 0 ? `<span class="badge-disc">-${{Math.round(p.discount_pct)}}%</span>` : '';
             const realHtml = p.is_real_deal ? `<span class="badge-real">🔥 لقطة حقيقية</span>` : (p.is_lowest_now ? `<span class="badge-real">📉 أقل سعر</span>` : '');
+            const isSaved = !!p.is_saved;
+            const savePayload = JSON.stringify({{
+                deal_key: String(p.sku),
+                title: p.name || '',
+                price: `${{Number(p.current_price).toFixed(2)}} BHD`,
+                url: p.affiliate_url || p.product_url || ''
+            }}).replace(/"/g, '&quot;');
             return `
                 <article class="deal-card">
                     <div class="deal-thumb">
@@ -1397,7 +1488,8 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
                         </div>
                         <div class="card-actions">
                             <a href="${{escapeHtml(p.affiliate_url)}}" target="_blank" rel="noopener" class="btn-buy">اذهب للعرض ↗</a>
-                            <button type="button" class="btn-hist" onclick="openHistoryModal('${{escapeHtml(p.sku)}}')" title="رسم تاريخ السعر">📊 السجل</button>
+                            <button type="button" class="btn-hist btn-save ${{isSaved ? 'saved' : ''}}" onclick='toggleSaveDeal(this, ${{savePayload}})' title="حفظ في المفضلة">${{isSaved ? '⭐ محفوظ' : '☆ حفظ'}}</button>
+                            <button type="button" class="btn-hist" onclick="openHistoryModal('${{escapeHtml(p.sku)}}')" title="رسم تاريخ السعر">📊</button>
                         </div>
                     </div>
                 </article>
@@ -1469,7 +1561,8 @@ def render_layout(page_title: str, active_nav: str, body_html: str, extra_script
 
 
 @app.get("/", response_class=HTMLResponse)
-def page_home():
+def page_home(request: Request):
+    user = get_current_user(request)
     body = f"""
     <section class="hero-box">
         <div>
@@ -1622,11 +1715,12 @@ def page_home():
         loadHome();
     </script>
     """
-    return render_layout("الرئيسية", "home", body, script)
+    return render_layout("الرئيسية", "home", body, script, user=user)
 
 
 @app.get("/deals", response_class=HTMLResponse)
-def page_deals():
+def page_deals(request: Request):
+    user = get_current_user(request)
     body = """
     <div class="sec-head">
         <div>
@@ -1742,11 +1836,12 @@ def page_deals():
         initCategoriesFilter().then(() => applyFilters(1));
     </script>
     """
-    return render_layout("العروض المباشرة", "deals", body, script)
+    return render_layout("العروض المباشرة", "deals", body, script, user=user)
 
 
 @app.get("/categories", response_class=HTMLResponse)
-def page_categories():
+def page_categories(request: Request):
+    user = get_current_user(request)
     body = """
     <div class="sec-head">
         <div>
@@ -1775,11 +1870,12 @@ def page_categories():
         });
     </script>
     """
-    return render_layout("الأقسام", "categories", body, script)
+    return render_layout("الأقسام", "categories", body, script, user=user)
 
 
 @app.get("/stores", response_class=HTMLResponse)
-def page_stores():
+def page_stores(request: Request):
+    user = get_current_user(request)
     body = """
     <div class="sec-head">
         <div>
@@ -1827,11 +1923,12 @@ def page_stores():
         });
     </script>
     """
-    return render_layout("المتاجر", "stores", body, script)
+    return render_layout("المتاجر", "stores", body, script, user=user)
 
 
 @app.get("/coupons", response_class=HTMLResponse)
-def page_coupons():
+def page_coupons(request: Request):
+    user = get_current_user(request)
     body = f"""
     <section class="hero-box" style="grid-template-columns:1fr; padding:26px 28px;">
         <div>
@@ -1885,17 +1982,19 @@ def page_coupons():
         }
     </script>
     """
-    return render_layout("كوبونات الخصم", "coupons", body, script)
+    return render_layout("كوبونات الخصم", "coupons", body, script, user=user)
 
 
 @app.get("/login", response_class=HTMLResponse)
-def page_login():
+def page_login(request: Request):
+    user = get_current_user(request)
     body = """
     <div class="auth-wrap">
         <h1 style="font-size:1.5rem; font-weight:900; margin-bottom:6px; text-align:center;">أهلاً بيك تاني 👋</h1>
         <p style="font-size:0.86rem; color:var(--text-secondary); text-align:center; margin-bottom:20px;">
-            سجّل دخولك لمتابعة تنبيهاتك وقائمة منتجاتك المفضلة
+            سجّل دخولك بحساب جوجل لمتابعة تنبيهاتك وقائمة منتجاتك المفضلة
         </p>
+        <a href="/login/google" class="btn-primary" style="width:100%; justify-content:center; padding:12px; font-size:0.95rem; margin-bottom:16px;">دخول سريع بحساب جوجل</a>
         <form onsubmit="event.preventDefault(); alert('واجهة تسجيل الدخول جاهزة — سيتم تفعيل الربط الكامل بالحسابات في المرحلة القادمة.');">
             <div class="form-group">
                 <label>البريد الإلكتروني</label>
@@ -1905,24 +2004,26 @@ def page_login():
                 <label>كلمة المرور</label>
                 <input type="password" required placeholder="••••••••" />
             </div>
-            <button type="submit" class="btn-primary" style="width:100%; justify-content:center; padding:12px; font-size:0.95rem;">دخول</button>
+            <button type="submit" class="btn-outline" style="width:100%; padding:11px; font-size:0.92rem; cursor:pointer;">دخول</button>
         </form>
         <p style="text-align:center; margin-top:16px; font-size:0.85rem; color:var(--text-secondary);">
             ما عندكش حساب؟ <a href="/register" style="color:var(--bh-red-bright); font-weight:800;">اعمل حساب جديد</a>
         </p>
     </div>
     """
-    return render_layout("تسجيل الدخول", "login", body)
+    return render_layout("تسجيل الدخول", "login", body, user=user)
 
 
 @app.get("/register", response_class=HTMLResponse)
-def page_register():
+def page_register(request: Request):
+    user = get_current_user(request)
     body = """
     <div class="auth-wrap">
         <h1 style="font-size:1.5rem; font-weight:900; margin-bottom:6px; text-align:center;">اعمل حساب مجاني 🌶️</h1>
         <p style="font-size:0.86rem; color:var(--text-secondary); text-align:center; margin-bottom:20px;">
             احفظ المنتجات اللي تهمك وتابع تاريخ أسعارها في البحرين
         </p>
+        <a href="/login/google" class="btn-primary" style="width:100%; justify-content:center; padding:12px; font-size:0.95rem; margin-bottom:16px;">متابعة بحساب جوجل</a>
         <form onsubmit="event.preventDefault(); alert('واجهة إنشاء الحساب جاهزة — سيتم تفعيل قاعدة بيانات المستخدمين في المرحلة القادمة.');">
             <div class="form-group">
                 <label>الاسم</label>
@@ -1936,14 +2037,14 @@ def page_register():
                 <label>كلمة المرور</label>
                 <input type="password" required placeholder="8 حروف على الأقل" />
             </div>
-            <button type="submit" class="btn-primary" style="width:100%; justify-content:center; padding:12px; font-size:0.95rem;">إنشاء الحساب</button>
+            <button type="submit" class="btn-outline" style="width:100%; padding:11px; font-size:0.92rem; cursor:pointer;">إنشاء الحساب</button>
         </form>
         <p style="text-align:center; margin-top:16px; font-size:0.85rem; color:var(--text-secondary);">
             عندك حساب بالفعل؟ <a href="/login" style="color:var(--bh-red-bright); font-weight:800;">سجّل دخول</a>
         </p>
     </div>
     """
-    return render_layout("حساب جديد", "register", body)
+    return render_layout("حساب جديد", "register", body, user=user)
 
 
 if __name__ == "__main__":
