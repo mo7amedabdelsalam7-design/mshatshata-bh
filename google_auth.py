@@ -1,12 +1,15 @@
+import hashlib
+import hmac
 import html
 import os
+import secrets
 import sqlite3
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from authlib.integrations.starlette_client import OAuth
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -84,6 +87,23 @@ def get_db():
     return DBConn()
 
 
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return f"pbkdf2_sha256${salt}${dk.hex()}"
+
+
+def verify_password(password: str, stored_hash: str | None) -> bool:
+    if not stored_hash or not password:
+        return False
+    parts = stored_hash.split("$")
+    if len(parts) != 3 or parts[0] != "pbkdf2_sha256":
+        return False
+    _, salt, hex_hash = parts
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return hmac.compare_digest(dk.hex(), hex_hash)
+
+
 def init_auth_tables():
     conn = get_db()
     cur = conn.cursor()
@@ -91,12 +111,25 @@ def init_auth_tables():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
-                google_id TEXT UNIQUE NOT NULL,
-                email TEXT NOT NULL,
+                google_id TEXT UNIQUE,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
                 name TEXT,
                 picture TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        cur.execute("ALTER TABLE users ALTER COLUMN google_id DROP NOT NULL")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'users_email_key'
+                ) THEN
+                    ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);
+                END IF;
+            END $$;
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS saved_deals (
@@ -114,13 +147,18 @@ def init_auth_tables():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                google_id TEXT UNIQUE NOT NULL,
-                email TEXT NOT NULL,
+                google_id TEXT UNIQUE,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT,
                 name TEXT,
                 picture TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("PRAGMA table_info(users)")
+        cols = {r["name"] for r in cur.fetchall()}
+        if "password_hash" not in cols:
+            cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS saved_deals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,24 +177,97 @@ def init_auth_tables():
 
 
 def upsert_user(google_id: str, email: str, name: str, picture: str) -> int:
+    email_norm = (email or "").strip().lower()
     conn = get_db()
     cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE google_id = ? OR email = ?", (google_id, email_norm))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(
+            """
+            UPDATE users
+            SET google_id = COALESCE(google_id, ?),
+                email = ?,
+                name = COALESCE(?, name),
+                picture = COALESCE(?, picture)
+            WHERE id = ?
+            """,
+            (google_id, email_norm, name, picture, existing["id"]),
+        )
+        conn.commit()
+        conn.close()
+        return existing["id"]
+
     cur.execute(
         """
         INSERT INTO users (google_id, email, name, picture)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(google_id) DO UPDATE SET
-            email = EXCLUDED.email,
-            name = EXCLUDED.name,
-            picture = EXCLUDED.picture
         """,
-        (google_id, email, name, picture),
+        (google_id, email_norm, name, picture),
     )
     conn.commit()
     cur.execute("SELECT id FROM users WHERE google_id = ?", (google_id,))
     row = cur.fetchone()
     conn.close()
     return row["id"]
+
+
+def register_local_user(name: str, email: str, password: str) -> tuple[bool, str, int | None]:
+    clean_name = (name or "").strip()
+    clean_email = (email or "").strip().lower()
+    if len(clean_name) < 2:
+        return False, "من فضلك أدخل اسماً صحيحاً (حرفين على الأقل).", None
+    if "@" not in clean_email or "." not in clean_email.split("@")[-1]:
+        return False, "من فضلك أدخل بريداً إلكترونياً صحيحاً.", None
+    if len(password or "") < 6:
+        return False, "كلمة المرور يجب أن تكون 6 أحرف على الأقل.", None
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash FROM users WHERE email = ?", (clean_email,))
+    existing = cur.fetchone()
+    if existing:
+        conn.close()
+        if existing.get("password_hash"):
+            return False, "هذا البريد الإلكتروني مسجل بالفعل. جرّب تسجيل الدخول.", None
+        return False, "هذا البريد مسجل عبر جوجل. استخدم زر (دخول بجوجل).", None
+
+    pw_hash = hash_password(password)
+    cur.execute(
+        """
+        INSERT INTO users (google_id, email, password_hash, name, picture)
+        VALUES (NULL, ?, ?, ?, NULL)
+        """,
+        (clean_email, pw_hash, clean_name),
+    )
+    conn.commit()
+    cur.execute("SELECT id FROM users WHERE email = ?", (clean_email,))
+    created = cur.fetchone()
+    conn.close()
+    return True, "تم إنشاء الحساب بنجاح!", created["id"] if created else None
+
+
+def authenticate_local_user(email: str, password: str) -> tuple[bool, str, int | None]:
+    clean_email = (email or "").strip().lower()
+    if not clean_email or not password:
+        return False, "من فضلك أدخل البريد الإلكتروني وكلمة المرور.", None
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash FROM users WHERE email = ?", (clean_email,))
+    user_row = cur.fetchone()
+    conn.close()
+
+    if not user_row:
+        return False, "البريد الإلكتروني أو كلمة المرور غير صحيحة.", None
+
+    if not user_row.get("password_hash"):
+        return False, "هذا الحساب مرتبط بجوجل ولا يملك كلمة مرور. استخدم (دخول بجوجل).", None
+
+    if not verify_password(password, user_row["password_hash"]):
+        return False, "البريد الإلكتروني أو كلمة المرور غير صحيحة.", None
+
+    return True, "تم تسجيل الدخول بنجاح!", user_row["id"]
 
 
 def get_current_user(request: Request):
@@ -199,16 +310,46 @@ def setup_google_auth(app: FastAPI):
     )
 
     oauth = OAuth()
-    oauth.register(
-        name="google",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-        client_kwargs={"scope": "openid email profile"},
-    )
+    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+        oauth.register(
+            name="google",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+            client_kwargs={"scope": "openid email profile"},
+        )
+
+    @app.post("/auth/register")
+    async def auth_register_post(
+        request: Request,
+        name: str = Form(...),
+        email: str = Form(...),
+        password: str = Form(...),
+    ):
+        ok, msg, user_id = register_local_user(name, email, password)
+        if not ok or not user_id:
+            q = urlencode({"error": msg})
+            return RedirectResponse(url=f"/register?{q}", status_code=302)
+        request.session["user_id"] = user_id
+        return RedirectResponse(url="/", status_code=302)
+
+    @app.post("/auth/login")
+    async def auth_login_post(
+        request: Request,
+        email: str = Form(...),
+        password: str = Form(...),
+    ):
+        ok, msg, user_id = authenticate_local_user(email, password)
+        if not ok or not user_id:
+            q = urlencode({"error": msg})
+            return RedirectResponse(url=f"/login?{q}", status_code=302)
+        request.session["user_id"] = user_id
+        return RedirectResponse(url="/", status_code=302)
 
     @app.get("/login/google")
     async def login_google(request: Request, next: str = "/"):
+        if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+            return RedirectResponse(url="/login?error=google_not_configured", status_code=302)
         request.session["next_url"] = next if next.startswith("/") else "/"
         redirect_uri = str(request.url_for("auth_callback"))
         if is_https and redirect_uri.startswith("http://"):

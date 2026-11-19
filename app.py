@@ -1986,23 +1986,30 @@ def page_coupons(request: Request):
 
 
 @app.get("/login", response_class=HTMLResponse)
-def page_login(request: Request):
+def page_login(request: Request, error: str = ""):
     user = get_current_user(request)
-    body = """
+    err_msg = "تسجيل الدخول بجوجل غير مفعّل حالياً." if error == "google_not_configured" else error
+    err_html = (
+        f'<div style="background:rgba(239,68,68,0.14);border:1px solid #EF4444;color:#FCA5A5;padding:10px 12px;border-radius:10px;margin-bottom:14px;font-size:0.85rem;font-weight:700;">{html.escape(err_msg)}</div>'
+        if err_msg
+        else ""
+    )
+    body = f"""
     <div class="auth-wrap">
         <h1 style="font-size:1.5rem; font-weight:900; margin-bottom:6px; text-align:center;">أهلاً بيك تاني 👋</h1>
         <p style="font-size:0.86rem; color:var(--text-secondary); text-align:center; margin-bottom:20px;">
-            سجّل دخولك بحساب جوجل لمتابعة تنبيهاتك وقائمة منتجاتك المفضلة
+            سجّل دخولك لمتابعة تنبيهاتك وقائمة منتجاتك المفضلة
         </p>
+        {err_html}
         <a href="/login/google" class="btn-primary" style="width:100%; justify-content:center; padding:12px; font-size:0.95rem; margin-bottom:16px;">دخول سريع بحساب جوجل</a>
-        <form onsubmit="event.preventDefault(); alert('واجهة تسجيل الدخول جاهزة — سيتم تفعيل الربط الكامل بالحسابات في المرحلة القادمة.');">
+        <form action="/auth/login" method="post">
             <div class="form-group">
                 <label>البريد الإلكتروني</label>
-                <input type="email" required placeholder="name@example.com" />
+                <input type="email" name="email" required placeholder="name@example.com" />
             </div>
             <div class="form-group">
                 <label>كلمة المرور</label>
-                <input type="password" required placeholder="••••••••" />
+                <input type="password" name="password" required placeholder="••••••••" />
             </div>
             <button type="submit" class="btn-outline" style="width:100%; padding:11px; font-size:0.92rem; cursor:pointer;">دخول</button>
         </form>
@@ -2015,27 +2022,33 @@ def page_login(request: Request):
 
 
 @app.get("/register", response_class=HTMLResponse)
-def page_register(request: Request):
+def page_register(request: Request, error: str = ""):
     user = get_current_user(request)
-    body = """
+    err_html = (
+        f'<div style="background:rgba(239,68,68,0.14);border:1px solid #EF4444;color:#FCA5A5;padding:10px 12px;border-radius:10px;margin-bottom:14px;font-size:0.85rem;font-weight:700;">{html.escape(error)}</div>'
+        if error
+        else ""
+    )
+    body = f"""
     <div class="auth-wrap">
         <h1 style="font-size:1.5rem; font-weight:900; margin-bottom:6px; text-align:center;">اعمل حساب مجاني 🌶️</h1>
         <p style="font-size:0.86rem; color:var(--text-secondary); text-align:center; margin-bottom:20px;">
             احفظ المنتجات اللي تهمك وتابع تاريخ أسعارها في البحرين
         </p>
+        {err_html}
         <a href="/login/google" class="btn-primary" style="width:100%; justify-content:center; padding:12px; font-size:0.95rem; margin-bottom:16px;">متابعة بحساب جوجل</a>
-        <form onsubmit="event.preventDefault(); alert('واجهة إنشاء الحساب جاهزة — سيتم تفعيل قاعدة بيانات المستخدمين في المرحلة القادمة.');">
+        <form action="/auth/register" method="post">
             <div class="form-group">
                 <label>الاسم</label>
-                <input type="text" required placeholder="مثال: محمد" />
+                <input type="text" name="name" required placeholder="مثال: محمد" />
             </div>
             <div class="form-group">
                 <label>البريد الإلكتروني</label>
-                <input type="email" required placeholder="name@example.com" />
+                <input type="email" name="email" required placeholder="name@example.com" />
             </div>
             <div class="form-group">
                 <label>كلمة المرور</label>
-                <input type="password" required placeholder="8 حروف على الأقل" />
+                <input type="password" name="password" required minlength="6" placeholder="6 أحرف على الأقل" />
             </div>
             <button type="submit" class="btn-outline" style="width:100%; padding:11px; font-size:0.92rem; cursor:pointer;">إنشاء الحساب</button>
         </form>
